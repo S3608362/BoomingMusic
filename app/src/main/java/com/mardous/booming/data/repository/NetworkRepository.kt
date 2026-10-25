@@ -9,6 +9,7 @@ import com.mardous.booming.R
 import com.mardous.booming.data.model.Song
 import com.mardous.booming.data.model.network.LoginParams
 import com.mardous.booming.data.model.network.LoginState
+import com.mardous.booming.data.model.network.NetworkFeature
 import com.mardous.booming.data.model.network.ScrobblingResult
 import com.mardous.booming.data.model.network.ScrobblingService
 import com.mardous.booming.data.model.network.lastfm.LastFmFailure
@@ -24,7 +25,12 @@ import com.mardous.booming.data.remote.lastfm.model.LastFmSessionResponse
 import com.mardous.booming.data.remote.lastfm.model.LastFmUser
 import com.mardous.booming.data.remote.lastfm.model.NowPlayingResponse
 import com.mardous.booming.data.remote.lastfm.model.ScrobbleResponse
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzQueue
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzResult
 import com.mardous.booming.data.remote.listenbrainz.ListenBrainzService
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzSessionStore
+import com.mardous.booming.data.remote.listenbrainz.ListenMetadata
+import com.mardous.booming.data.remote.listenbrainz.ListenMetadataResolver
 import com.mardous.booming.data.remote.listenbrainz.model.ListenBrainzListen
 import com.mardous.booming.data.remote.listenbrainz.model.ListenBrainzSubmission
 import com.mardous.booming.data.remote.listenbrainz.model.ListenBrainzTrackAdditionalInfo
@@ -65,6 +71,8 @@ class NetworkRepositoryImpl(
     private val preferences: SharedPreferences,
     private val lastFmService: LastFmService,
     private val listenBrainzService: ListenBrainzService,
+    private val listenBrainzSessionStore: ListenBrainzSessionStore,
+    private val listenBrainzQueue: ListenBrainzQueue,
     private val deezerService: DeezerService,
     private val musicBrainzService: MusicBrainzService
 ) : NetworkRepository {
@@ -76,6 +84,7 @@ class NetworkRepositoryImpl(
     private val listenBrainzLoginState get() = listenBrainzLoginStateFlow.value
 
     private val appName = context.getString(R.string.app_name)
+    private val listenMetadataResolver = ListenMetadataResolver()
 
     init {
         val lastFmSessionInfo = getLastFmSessionInfo()
@@ -86,11 +95,11 @@ class NetworkRepositoryImpl(
             )
         }
 
-        val listenBrainzSessionInfo = getListenBrainzSessionInfo()
-        if (listenBrainzSessionInfo != null) {
+        val listenBrainzUserName = listenBrainzSessionStore.userName()
+        if (listenBrainzUserName != null) {
             listenBrainzLoginStateFlow.value = LoginState.LoggedIn(
-                username = listenBrainzSessionInfo.user,
-                url = listenBrainzSessionInfo.url
+                username = listenBrainzUserName,
+                url = "https://listenbrainz.org/user/$listenBrainzUserName/"
             )
         }
     }
@@ -421,11 +430,12 @@ class NetworkRepositoryImpl(
         try {
             val response = listenBrainzService.validateToken(token)
             if (response.valid && response.userName != null) {
-                if (setListenBrainzToken(token, response.userName)) {
+                if (listenBrainzSessionStore.save(token, response.userName)) {
                     listenBrainzLoginStateFlow.value = LoginState.LoggedIn(
                         username = response.userName,
                         url = "https://listenbrainz.org/user/${response.userName}/"
                     )
+                    listenBrainzQueue.start()
                 } else {
                     listenBrainzLoginStateFlow.value = LoginState.Failure(
                         context.getString(R.string.error_listenbrainz_generic)
@@ -444,11 +454,10 @@ class NetworkRepositoryImpl(
         }
     }
 
-    private fun logoutFromListenBrainz() {
+    private suspend fun logoutFromListenBrainz() {
         try {
-            preferences.edit(commit = true) {
-                remove(LISTEN_BRAINZ_SESSION_INFO)
-            }
+            listenBrainzSessionStore.clear()
+            listenBrainzQueue.clear()
             listenBrainzLoginStateFlow.value = LoginState.Empty
         } catch (e: Exception) {
             Log.e(TAG, "ListenBrainz: logout error", e)
@@ -456,105 +465,84 @@ class NetworkRepositoryImpl(
     }
 
     private suspend fun scrobbleToListenBrainz(song: Song, timestamp: Long): ScrobblingResult {
-        val sessionInfo = getListenBrainzSessionInfo()
+        if (!NetworkFeature.ListenBrainz.Scrobbling.isEnabled) return ScrobblingResult.Failure()
+        val token = listenBrainzSessionStore.token()
             ?: return ScrobblingResult.Failure()
-        try {
-            val additionalInfo = if (!BuildConfig.DEBUG) {
-                ListenBrainzTrackAdditionalInfo(
-                    player = appName,
-                    playerVersion = BuildConfig.VERSION_NAME
-                )
-            } else null
+        val listen = buildListen(song, timestamp)
 
-            val submission = ListenBrainzSubmission(
-                listenType = "single",
-                payload = listOf(
-                    ListenBrainzListen(
-                        listenedAt = timestamp,
-                        trackMetadata = ListenBrainzTrackMetadata(
-                            artistName = song.displayArtistName(),
-                            trackName = song.title,
-                            releaseName = song.albumName,
-                            additionalInfo = additionalInfo
-                        )
-                    )
-                )
-            )
-            val response = listenBrainzService.submitListen(sessionInfo.token, submission)
-            return if (response.status == "ok") {
-                ScrobblingResult.Success(song.id)
-            } else {
-                ScrobblingResult.Failure(response.error)
+        if (!NetworkFeature.ListenBrainz.Scrobbling.isAvailable) {
+            listenBrainzQueue.enqueue(listen)
+            return ScrobblingResult.Queued
+        }
+
+        return when (val result = listenBrainzService.submitListens(
+            token = token,
+            submission = ListenBrainzSubmission(SINGLE, listOf(listen))
+        )) {
+            ListenBrainzResult.Success -> ScrobblingResult.Success(song.id)
+            ListenBrainzResult.Unauthorized -> {
+                logoutFromListenBrainz()
+                ScrobblingResult.Failure(context.getString(R.string.error_listenbrainz_invalid_token))
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "ListenBrainz: scrobble call failed!", e)
-            return ScrobblingResult.Failure(context.getString(R.string.error_listenbrainz_generic))
+
+            is ListenBrainzResult.RateLimited,
+            ListenBrainzResult.Retry -> {
+                listenBrainzQueue.enqueue(listen)
+                ScrobblingResult.Queued
+            }
+
+            is ListenBrainzResult.Rejected -> ScrobblingResult.Failure(result.message)
         }
     }
 
     private suspend fun updateNowPlayingOnListenBrainz(song: Song): ScrobblingResult {
-        val sessionInfo = getListenBrainzSessionInfo()
+        val token = listenBrainzSessionStore.token()
             ?: return ScrobblingResult.Failure()
-        try {
-            val additionalInfo = if (!BuildConfig.DEBUG) {
-                ListenBrainzTrackAdditionalInfo(
-                    player = appName,
-                    playerVersion = BuildConfig.VERSION_NAME
-                )
-            } else null
+        val listen = buildListen(song, null)
 
-            val submission = ListenBrainzSubmission(
-                listenType = "playing_now",
-                payload = listOf(
-                    ListenBrainzListen(
-                        trackMetadata = ListenBrainzTrackMetadata(
-                            artistName = song.displayArtistName(),
-                            trackName = song.title,
-                            releaseName = song.albumName,
-                            additionalInfo = additionalInfo
-                        )
-                    )
+        return when (val result = listenBrainzService.submitListens(
+            token = token,
+            submission = ListenBrainzSubmission(PLAYING_NOW, listOf(listen))
+        )) {
+            ListenBrainzResult.Success -> ScrobblingResult.Success(song.id)
+            ListenBrainzResult.Unauthorized -> {
+                logoutFromListenBrainz()
+                ScrobblingResult.Failure(context.getString(R.string.error_listenbrainz_invalid_token))
+            }
+
+            is ListenBrainzResult.RateLimited,
+            ListenBrainzResult.Retry -> ScrobblingResult.Failure(
+                context.getString(R.string.error_listenbrainz_generic)
+            )
+
+            is ListenBrainzResult.Rejected -> ScrobblingResult.Failure(result.message)
+        }
+    }
+
+    private fun buildListen(song: Song, listenedAt: Long?): ListenBrainzListen {
+        val metadata: ListenMetadata = listenMetadataResolver.resolve(song)
+        return ListenBrainzListen(
+            listenedAt = listenedAt,
+            trackMetadata = ListenBrainzTrackMetadata(
+                artistName = metadata.artistName,
+                trackName = metadata.trackName,
+                releaseName = metadata.releaseName,
+                additionalInfo = ListenBrainzTrackAdditionalInfo(
+                    player = appName,
+                    playerVersion = BuildConfig.VERSION_NAME,
+                    submissionClient = appName,
+                    submissionClientVersion = BuildConfig.VERSION_NAME,
+                    recordingMbid = metadata.recordingMbid,
+                    releaseMbid = metadata.releaseMbid,
+                    releaseGroupMbid = metadata.releaseGroupMbid,
+                    trackMbid = metadata.trackMbid,
+                    artistMbids = metadata.artistMbids.ifEmpty { null },
+                    workMbids = metadata.workMbids.ifEmpty { null },
+                    trackNumber = metadata.trackNumber,
+                    durationMs = metadata.durationMs
                 )
             )
-            val response = listenBrainzService.submitListen(sessionInfo.token, submission)
-            return if (response.status == "ok") {
-                ScrobblingResult.Success(song.id)
-            } else {
-                ScrobblingResult.Failure(response.error)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "ListenBrainz: updateNowPlaying call failed!", e)
-            return ScrobblingResult.Failure(context.getString(R.string.error_listenbrainz_generic))
-        }
-    }
-
-    private fun setListenBrainzToken(token: String, userName: String): Boolean {
-        return try {
-            val encryptedToken = CryptoUtil.encrypt(token)
-            val sessionInfo = Json.encodeToString(ListenBrainzSessionInfo(userName, encryptedToken))
-            val encodedValue = Base64.encode(sessionInfo.toByteArray())
-            preferences.edit(commit = true) {
-                putString(LISTEN_BRAINZ_SESSION_INFO, encodedValue)
-            }
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Couldn't save ListenBrainz token.", e)
-            false
-        }
-    }
-
-    private fun getListenBrainzSessionInfo(): ListenBrainzSessionInfo? {
-        val encodedValue = preferences.getString(LISTEN_BRAINZ_SESSION_INFO, null)
-        if (!encodedValue.isNullOrBlank()) {
-            try {
-                val decodedValue = Base64.decode(encodedValue)
-                val sessionInfo = Json.decodeFromString<ListenBrainzSessionInfo>(String(decodedValue))
-                return sessionInfo.copy(token = CryptoUtil.decrypt(sessionInfo.token))
-            } catch (e: Exception) {
-                Log.e(TAG, "Couldn't decrypt ListenBrainz session info. Removing...", e)
-            }
-        }
-        return null
+        )
     }
 
     @Serializable
@@ -565,19 +553,11 @@ class NetworkRepositoryImpl(
         val key: String
     )
 
-    @Serializable
-    private data class ListenBrainzSessionInfo(
-        @SerialName("user_name")
-        val user: String,
-        val token: String
-    ) {
-        val url = "https://listenbrainz.org/user/$user/"
-    }
-
     companion object {
         private const val TAG = "NetworkRepository"
 
         private const val LAST_FM_SESSION_INFO = "lastfm_session"
-        private const val LISTEN_BRAINZ_SESSION_INFO = "listenbrainz_session"
+        private const val SINGLE = "single"
+        private const val PLAYING_NOW = "playing_now"
     }
 }

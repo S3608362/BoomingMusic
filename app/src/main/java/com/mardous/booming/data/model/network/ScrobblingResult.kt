@@ -20,4 +20,5 @@ package com.mardous.booming.data.model.network
 sealed class ScrobblingResult {
     class Success(val songId: Long) : ScrobblingResult()
     class Failure(val message: String? = null) : ScrobblingResult()
+    data object Queued : ScrobblingResult()
 }

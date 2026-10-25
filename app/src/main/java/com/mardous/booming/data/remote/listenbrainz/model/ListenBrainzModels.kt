@@ -33,9 +33,29 @@ data class ListenBrainzTrackMetadata(
 @Serializable
 data class ListenBrainzTrackAdditionalInfo(
     @SerialName("media_player")
-    val player: String,
+    val player: String? = null,
     @SerialName("media_player_version")
-    val playerVersion: String
+    val playerVersion: String? = null,
+    @SerialName("submission_client")
+    val submissionClient: String? = null,
+    @SerialName("submission_client_version")
+    val submissionClientVersion: String? = null,
+    @SerialName("recording_mbid")
+    val recordingMbid: String? = null,
+    @SerialName("release_mbid")
+    val releaseMbid: String? = null,
+    @SerialName("release_group_mbid")
+    val releaseGroupMbid: String? = null,
+    @SerialName("track_mbid")
+    val trackMbid: String? = null,
+    @SerialName("artist_mbids")
+    val artistMbids: List<String>? = null,
+    @SerialName("work_mbids")
+    val workMbids: List<String>? = null,
+    @SerialName("tracknumber")
+    val trackNumber: String? = null,
+    @SerialName("duration_ms")
+    val durationMs: Long? = null
 )
 
 @Serializable

@@ -694,9 +694,11 @@ class PlaybackService :
     }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
-        if (player.playbackState == Player.STATE_ENDED &&
-            preferences.getBoolean(CLEAR_QUEUE_ON_COMPLETION, false)) {
-            player.exoPlayer.clearMediaItems()
+        if (playbackState == Player.STATE_ENDED) {
+            scrobbleIfNeeded()
+            if (preferences.getBoolean(CLEAR_QUEUE_ON_COMPLETION, false)) {
+                player.exoPlayer.clearMediaItems()
+            }
         }
         refreshMediaButtonCustomLayout()
     }
@@ -732,6 +734,7 @@ class PlaybackService :
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
         if (!isPlaying) {
+            scrobbleIfNeeded()
             val currentDurationMs = player.mediaMetadata.durationMs ?: 0
             if (currentDurationMs > 0) {
                 if (!player.currentTimeline.isEmpty) {
@@ -764,11 +767,12 @@ class PlaybackService :
 
             val previousSong = songPlayCountHelper.song
             val shouldBumpPlayCount = songPlayCountHelper.shouldBumpPlayCount()
+            scrobbleIfNeeded()
             songPlayCountHelper.notifySongChanged(newSong, isPlaying)
 
             val enableHistory = preferences.getBoolean(ENABLE_HISTORY, true)
-            if (enableHistory && newSong != Song.emptySong && !newSong.resolvedFromFile) {
-                if (preferences.getBoolean(ENABLE_HISTORY, true)) {
+            if (newSong != Song.emptySong && !newSong.resolvedFromFile) {
+                if (enableHistory) {
                     repository.upsertSongInHistory(newSong)
                 }
                 if (NetworkFeature.Lastfm.NowPlaying.isAvailable) {
@@ -779,19 +783,11 @@ class PlaybackService :
                 }
             }
             if (enableHistory && previousSong != Song.emptySong && !previousSong.resolvedFromFile) {
-                val timestampMillis = System.currentTimeMillis()
-                val timestampSeconds = (timestampMillis / 1000)
                 if (shouldBumpPlayCount) {
                     repository.insertOrIncrementPlayCount(
                         song = previousSong,
-                        timePlayed = timestampMillis
+                        timePlayed = System.currentTimeMillis()
                     )
-                    if (NetworkFeature.Lastfm.Scrobbling.isAvailable) {
-                        launch { repository.scrobble(ScrobblingService.Lastfm, previousSong, timestampSeconds) }
-                    }
-                    if (NetworkFeature.ListenBrainz.Scrobbling.isAvailable) {
-                        launch { repository.scrobble(ScrobblingService.ListenBrainz, previousSong, timestampSeconds) }
-                    }
                 } else if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK) {
                     repository.insertOrIncrementSkipCount(previousSong)
                 }
@@ -804,6 +800,20 @@ class PlaybackService :
 
         persistentStorage.saveState()
         widgets.refresh()
+    }
+
+    private fun scrobbleIfNeeded() {
+        val (song, timestamp) = songPlayCountHelper.takeScrobble() ?: return
+        if (NetworkFeature.Lastfm.Scrobbling.isAvailable) {
+            serviceScope.launch(IO) {
+                repository.scrobble(ScrobblingService.Lastfm, song, timestamp)
+            }
+        }
+        if (NetworkFeature.ListenBrainz.Scrobbling.isEnabled) {
+            serviceScope.launch(IO) {
+                repository.scrobble(ScrobblingService.ListenBrainz, song, timestamp)
+            }
+        }
     }
 
     private fun submitReplayGain(currentItem: MediaItem? = player.currentMediaItem) {

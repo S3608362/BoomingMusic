@@ -32,7 +32,10 @@ import com.mardous.booming.data.remote.deezer.DeezerService
 import com.mardous.booming.data.remote.github.GitHubService
 import com.mardous.booming.data.remote.jsonHttpClient
 import com.mardous.booming.data.remote.lastfm.LastFmService
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzQueue
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzRateLimiter
 import com.mardous.booming.data.remote.listenbrainz.ListenBrainzService
+import com.mardous.booming.data.remote.listenbrainz.ListenBrainzSessionStore
 import com.mardous.booming.data.remote.lyrics.LyricsDownloadService
 import com.mardous.booming.data.remote.musicbrainz.MusicBrainzService
 import com.mardous.booming.data.remote.provideOkHttp
@@ -95,7 +98,10 @@ val networkModule = module {
     single { GitHubService(context = androidContext(), client = get()) }
     single { DeezerService(client = get()) }
     single { LastFmService(client = get()) }
-    single { ListenBrainzService(client = get()) }
+    single { ListenBrainzRateLimiter() }
+    single { ListenBrainzService(client = get(), rateLimiter = get()) }
+    single { ListenBrainzSessionStore(preferences = get()) }
+    single { ListenBrainzQueue(dao = get(), service = get(), sessionStore = get()) }
     single { MusicBrainzService(client = get()) }
     single { LyricsDownloadService(client = get()) }
     single { QueueStateHolder() }
@@ -161,7 +167,8 @@ private val roomModule = module {
                 BoomingDatabase.MIGRATION_3_4,
                 BoomingDatabase.MIGRATION_4_5,
                 BoomingDatabase.MIGRATION_5_6,
-                BoomingDatabase.MIGRATION_6_7
+                BoomingDatabase.MIGRATION_6_7,
+                BoomingDatabase.MIGRATION_7_8
             )
             .build()
     }
@@ -192,6 +199,10 @@ private val roomModule = module {
 
     factory {
         get<BoomingDatabase>().autoEqDao()
+    }
+
+    factory {
+        get<BoomingDatabase>().listenBrainzQueueDao()
     }
 }
 
@@ -276,6 +287,8 @@ private val dataModule = module {
             preferences = get(),
             lastFmService = get(),
             listenBrainzService = get(),
+            listenBrainzSessionStore = get(),
+            listenBrainzQueue = get(),
             deezerService = get(),
             musicBrainzService = get()
         )
